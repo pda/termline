@@ -6,3 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+
+# Raw FFI bindings to libc
+# https://lib.rs/crates/libc
+# https://docs.rs/libc/latest/libc/
+# https://github.com/rust-lang/libc
+# https://rust-lang.github.io/libc/
+libc = "0.2"
