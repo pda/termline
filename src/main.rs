@@ -2,11 +2,15 @@ use std::io;
 use std::io::Error;
 use std::io::Read;
 use std::io::Write;
-use std::io::{stdin, stdout};
+use std::io::{stderr, stdin};
 use std::mem;
+use std::process::ExitCode;
 
 const CTRL_C: u8 = 0x03;
+const CR: u8 = 0x0d;
+const LF: u8 = 0x0a;
 const ESC: u8 = 0x1b;
+
 const DEBUG: bool = true;
 
 #[derive(Debug)]
@@ -24,17 +28,12 @@ struct Termline {
     buf: Vec<u8>,
     pos: usize,
     state: State,
-    log: std::fs::File,
+    args: Vec<u8>,
+    msg: String,
 }
 
 impl Termline {
     fn new(input: Box<dyn Read>, output: Box<dyn Write>, prompt: Vec<u8>) -> Result<Self, Error> {
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("termline.log")
-            .unwrap();
-
         Ok(Self {
             input,
             output,
@@ -42,12 +41,13 @@ impl Termline {
             buf: Vec::new(),
             pos: 0,
             state: State::Normal,
-            log,
+            args: Vec::new(),
+            msg: String::new(),
         })
     }
 
     fn stdio(prompt: Vec<u8>) -> Result<Self, Error> {
-        Self::new(Box::new(stdin()), Box::new(stdout()), prompt)
+        Self::new(Box::new(stdin()), Box::new(stderr()), prompt)
     }
 
     fn run(&mut self) -> Result<Vec<u8>, Error> {
@@ -58,17 +58,17 @@ impl Termline {
         self.output.flush()?;
 
         let mut run = true;
+        let mut success = false;
         while run {
             if DEBUG {
                 let mut debug = vec![];
                 // ensure there's two spare lines underneath
-                debug.extend_from_slice(&[0x0a, 0x0a]); // new lines
-                debug.extend_from_slice(&[ESC, b'[', b'2', b'A']); // CUU: Cursor Up
+                debug.extend_from_slice(b"\n\n\n\n\x1b[4A"); // add new lines below prompt, scroll back up
                 debug.extend_from_slice(&[ESC, b'7']); // DECSC: DEC Save Cursor
-                debug.extend_from_slice(&[0x0d, 0x0a]); // CR,LF
+                debug.extend_from_slice(b"\x1b[2m"); // dim text
                 debug.extend(
                     format!(
-                        "\x1b[2m\x1b[G\x1b[Kbuf: {}\n\x1b[G\x1b[K     {}^pos:{} len:{}",
+                        "\n\x1b[G\x1b[Kbuf: {}\n\x1b[G\x1b[K     {}^pos:{} len:{}",
                         String::from_utf8_lossy(&self.buf),
                         " ".repeat(self.pos),
                         self.pos,
@@ -76,72 +76,61 @@ impl Termline {
                     )
                     .bytes(),
                 );
+                debug.extend(
+                    format!(
+                        "\n\x1b[G\x1b[Kstate: {:?}, args: [{}]",
+                        self.state,
+                        String::from_utf8_lossy(&self.args),
+                    )
+                    .bytes(),
+                );
+                debug.extend(format!("\n\x1b[G\x1b[Kmsg: {}", self.msg).bytes());
                 debug.extend_from_slice(&[ESC, b'8']); // DECRC: DEC Restore Cursor
-                self.emit(&debug)?;
+                self.output.write_all(&debug)?;
+                self.output.flush()?
             }
 
             match self.input.read(&mut bufin) {
                 Ok(size) => {
-                    write!(
-                        self.log,
-                        "### bytes read: {}: {}\n",
-                        size,
-                        String::from_utf8_lossy(
-                            &bufin[..size]
-                                .iter()
-                                .map(|x| std::ascii::escape_default(*x).collect::<Vec<u8>>())
-                                .flatten()
-                                .collect::<Vec<u8>>()
-                        )
-                    )?;
-
                     for n in 0..size {
-                        let b = bufin[n];
-                        if b == CTRL_C {
-                            run = false;
-                        }
+                        match bufin[n] {
+                            CTRL_C => run = false,
+                            CR | LF => (run, success) = (false, true),
+                            n => match self.accept(n) {
+                                Ok(r) => match r {
+                                    Some(out) => {
+                                        self.output.write_all(&out)?;
+                                        self.output.flush()?;
+                                    }
+                                    None => (),
+                                },
 
-                        write!(self.log, "b: {b:#04x}\n")?;
-
-                        match self.accept(b) {
-                            Ok(r) => match r {
-                                Some(out) => {
-                                    self.emit(&out)?;
-
-                                    write!(
-                                        self.log,
-                                        "buf: {}\n     {}^pos:{} len:{}\n",
-                                        String::from_utf8_lossy(&self.buf),
-                                        " ".repeat(self.pos),
-                                        self.pos,
-                                        self.buf.len(),
-                                    )?;
+                                Err(err) => {
+                                    panic!("{}", err);
                                 }
-
-                                None => {}
                             },
-
-                            Err(err) => {
-                                panic!("{}", err);
-                            }
                         }
                     }
                 }
-                Err(e) => write!(self.log, "read error: {e}\n").unwrap(),
+                Err(e) => self.msg.replace_range(.., &format!("read error: {e}")),
             };
         }
 
-        let result: libc::c_int;
         unsafe {
-            result = libc::tcsetattr(libc::STDOUT_FILENO, 0, &mut termios_orig.unwrap());
+            Self::check_c_err(libc::tcsetattr(
+                libc::STDERR_FILENO,
+                0,
+                &mut termios_orig.unwrap(),
+            ))?;
         }
 
-        if result == -1 {
-            panic!("{}", io::Error::last_os_error());
-        }
-        println!();
+        write!(self.output, "\x1b[J\n")?;
 
-        Ok(self.buf.to_owned())
+        if success {
+            Ok(self.buf.to_owned())
+        } else {
+            Err(std::io::ErrorKind::Interrupted.into())
+        }
     }
 
     fn accept(&mut self, b: u8) -> Result<Option<Vec<u8>>, Error> {
@@ -162,7 +151,7 @@ impl Termline {
                     }
                     Some(to_emit)
                 }
-                0x7f /* backspace (del) */ => {
+                0x7f /* backspace */ => {
                     if self.pos >= 1 {
                         self.pos -= 1;
                         self.buf.remove(self.pos);
@@ -190,7 +179,7 @@ impl Termline {
                     None
                 }
                 _ => {
-                    write!(self.log, "unhandled char: {b:#04x}\n")?;
+                    self.msg.replace_range(.., &format!("unhandled char: {b:#04x}"));
                     write!(self.output, "<?>")?;
                     None
                 }
@@ -201,7 +190,8 @@ impl Termline {
                     None
                 }
                 _ => {
-                    write!(self.log, "unhandled escape: {b:#04x}\n")?;
+                    self.msg
+                        .replace_range(.., &format!("unhandled escape: {b:#04x}"));
                     self.transition(State::Normal);
                     None
                 }
@@ -209,7 +199,10 @@ impl Termline {
             State::CSI => match b {
                 // TODO: handle Delete i.e. CSI 3 ~
                 // TODO: handle multi-byte CSI (parameters)
-
+                b'0'..=b'9' | b';' => {
+                    self.args.push(b);
+                    None
+                }
                 // CUF: Cursor Forward
                 b'C' => {
                     self.transition(State::Normal);
@@ -217,7 +210,7 @@ impl Termline {
                         self.pos += 1;
                         Some(vec![ESC, b'[', b'C'])
                     } else {
-                        write!(self.log, "CUF blocked\n")?;
+                        self.msg.replace_range(.., &format!("CUF rejected"));
                         None
                     }
                 }
@@ -228,12 +221,48 @@ impl Termline {
                         self.pos -= 1;
                         Some(vec![ESC, b'[', b'D'])
                     } else {
-                        write!(self.log, "CUB blocked\n")?;
+                        self.msg.replace_range(.., &format!("CUB rejected"));
                         None
                     }
                 }
+                // vt input sequences (home, insert, delete etc)
+                b'~' => match self.args[..] {
+                    // DEL (CSI 3 ~)
+                    [b'3'] => {
+                        if self.pos < self.buf.len() {
+                            let x = self.buf.remove(self.pos);
+                            self.msg.replace_range(.., &format!("DEL: {:#04X}", x));
+                            let tail = &self.buf[self.pos..];
+                            let mut emit = vec![];
+                            if tail.len() > 0 {
+                                emit.extend_from_slice(tail);
+                                emit.extend_from_slice(&[ESC, b'[', b'K']);
+
+                                // go back
+                                emit.extend_from_slice(&[ESC, b'[']);
+                                emit.extend_from_slice(&tail.len().to_string().as_bytes());
+                                emit.extend_from_slice(&[b'D']);
+                            } else {
+                                emit.extend_from_slice(&[ESC, b'[', b'K']);
+                            }
+
+                            self.transition(State::Normal);
+                            Some(emit)
+                        } else {
+                            self.transition(State::Normal);
+                            None
+                        }
+                    }
+                    _ => {
+                        self.msg
+                            .replace_range(.., &format!("unhandled VT input {:?}~", self.args));
+                        self.transition(State::Normal);
+                        None
+                    }
+                },
                 _ => {
-                    write!(self.log, "unhandled CSI: {b:#04x}\n")?;
+                    self.msg
+                        .replace_range(.., &format!("unhandled CSI {b:#04x}"));
                     self.transition(State::Normal);
                     None
                 }
@@ -242,32 +271,19 @@ impl Termline {
     }
 
     fn transition(&mut self, s: State) {
-        write!(self.log, "state: {:?} -> {:?}\n", self.state, s).unwrap();
+        self.args.clear();
         self.state = s;
     }
 
-    fn emit(&mut self, x: &[u8]) -> Result<(), Error> {
-        write!(self.log, "emit: {:?}\n", String::from_utf8_lossy(&x))?;
-        self.output.write_all(&x)?;
-        self.output.flush()
-    }
-
     fn set_raw() -> Result<libc::termios, io::Error> {
-        let mut termios: libc::termios;
-
-        unsafe {
-            termios = mem::zeroed();
-            Self::check_c_err(libc::tcgetattr(libc::STDOUT_FILENO, &mut termios))?;
-        }
-
-        let mut termios_raw = termios;
-
-        unsafe {
+        Ok(unsafe {
+            let mut termios: libc::termios = mem::zeroed();
+            Self::check_c_err(libc::tcgetattr(libc::STDERR_FILENO, &mut termios))?;
+            let mut termios_raw = termios;
             libc::cfmakeraw(&mut termios_raw);
-            Self::check_c_err(libc::tcsetattr(libc::STDOUT_FILENO, 0, &termios_raw))?;
-        }
-
-        Ok(termios)
+            Self::check_c_err(libc::tcsetattr(libc::STDERR_FILENO, 0, &termios_raw))?;
+            termios
+        })
     }
 
     fn check_c_err(x: libc::c_int) -> Result<(), Error> {
@@ -279,8 +295,16 @@ impl Termline {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     let mut termline = Termline::stdio("termline> ".into()).unwrap();
-    let result = termline.run().unwrap();
-    println!("{}", String::from_utf8_lossy(&result));
+    match termline.run() {
+        Ok(result) => {
+            println!("{}", String::from_utf8_lossy(&result));
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            write!(stderr(), "Error: {}\n", err).unwrap();
+            ExitCode::FAILURE
+        }
+    }
 }
