@@ -7,8 +7,8 @@ use std::mem;
 use std::process::ExitCode;
 
 const CTRL_C: u8 = 0x03;
-const CR: u8 = 0x0d;
 const LF: u8 = 0x0a;
+const CR: u8 = 0x0d;
 const ESC: u8 = 0x1b;
 
 const DEBUG: bool = true;
@@ -62,13 +62,14 @@ impl Termline {
         while run {
             if DEBUG {
                 let mut debug = vec![];
-                // ensure there's two spare lines underneath
-                debug.extend_from_slice(b"\n\n\n\n\x1b[4A"); // add new lines below prompt, scroll back up
+                // ensure there's spare lines underneath
+                debug.extend_from_slice(&[LF, LF, LF, LF, LF, ESC, b'[', b'5', b'A']); // add new lines below prompt, scroll back up
                 debug.extend_from_slice(&[ESC, b'7']); // DECSC: DEC Save Cursor
-                debug.extend_from_slice(b"\x1b[2m"); // dim text
+                debug.extend_from_slice(&[ESC, b'[', b'J']); // Erase in Display (cursor to end)
+                debug.extend_from_slice(&[ESC, b'[', b'2', b'm']); // dim text
                 debug.extend(
                     format!(
-                        "\n\x1b[G\x1b[Kbuf: {}\n\x1b[G\x1b[K     {}^pos:{} len:{}",
+                        "\r\nbuf: {}\r\n     {}^pos:{} len:{}",
                         String::from_utf8_lossy(&self.buf),
                         " ".repeat(self.pos),
                         self.pos,
@@ -78,13 +79,13 @@ impl Termline {
                 );
                 debug.extend(
                     format!(
-                        "\n\x1b[G\x1b[Kstate: {:?}, args: [{}]",
+                        "\r\nstate: {:?}, args: [{}]",
                         self.state,
                         String::from_utf8_lossy(&self.args),
                     )
                     .bytes(),
                 );
-                debug.extend(format!("\n\x1b[G\x1b[Kmsg: {}", self.msg).bytes());
+                debug.extend(format!("\r\nmsg: {}", self.msg).bytes());
                 debug.extend_from_slice(&[ESC, b'8']); // DECRC: DEC Restore Cursor
                 self.output.write_all(&debug)?;
                 self.output.flush()?
