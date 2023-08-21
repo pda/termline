@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io;
 use std::io::Error;
 use std::io::Read;
@@ -12,6 +13,8 @@ const ESC: u8 = 0x1b;
 const LF: u8 = 0x0a;
 
 const DEBUG: bool = true;
+
+thread_local!(static SIGWINCH: RefCell<bool> = false.into());
 
 #[derive(Debug)]
 enum State {
@@ -30,6 +33,7 @@ struct Termline {
     state: State,
     args: Vec<u8>,
     msg: String,
+    cols: Option<u16>,
 }
 
 impl Termline {
@@ -43,6 +47,7 @@ impl Termline {
             state: State::Normal,
             args: Vec::new(),
             msg: String::new(),
+            cols: None,
         })
     }
 
@@ -54,12 +59,19 @@ impl Termline {
         let termios_orig = Self::set_raw();
         let mut bufin = [0; 16];
 
+        self.cols = Some(Self::get_width()?);
+        Self::listen_for_window_resize()?;
+
         self.output.write_all(&self.prompt)?;
         self.output.flush()?;
 
         let mut run = true;
         let mut success = false;
         while run {
+            if Self::has_window_resized() {
+                self.cols = Some(Self::get_width()?);
+            }
+
             if DEBUG {
                 let mut debug = vec![];
                 // ensure there's spare lines underneath
@@ -77,6 +89,10 @@ impl Termline {
                     )
                     .bytes(),
                 );
+                match self.cols {
+                    None => debug.extend(format!("\r\ncols: ?").bytes()),
+                    Some(cols) => debug.extend(format!("\r\ncols: {cols}").bytes()),
+                }
                 debug.extend(
                     format!(
                         "\r\nstate: {:?}, args: [{}]",
@@ -271,6 +287,43 @@ impl Termline {
     fn transition(&mut self, s: State) {
         self.args.clear();
         self.state = s;
+    }
+
+    fn get_width() -> Result<u16, Error> {
+        unsafe {
+            let mut ws: libc::winsize = mem::zeroed();
+            Self::check_c_err(libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws))?;
+            Ok(ws.ws_col)
+        }
+    }
+
+    fn listen_for_window_resize() -> Result<(), Error> {
+        extern "C" fn handle_sigwinch(_: libc::c_int) {
+            SIGWINCH.with(|val| *val.borrow_mut() = true);
+        }
+
+        Self::check_c_err(unsafe {
+            libc::sigaction(
+                libc::SIGWINCH,
+                &libc::sigaction {
+                    sa_flags: 0,
+                    sa_mask: 0,
+                    sa_sigaction: handle_sigwinch as libc::sighandler_t,
+                },
+                std::ptr::null_mut(),
+            )
+        })
+    }
+
+    fn has_window_resized() -> bool {
+        SIGWINCH.with(|val| {
+            if *val.borrow() {
+                *val.borrow_mut() = false;
+                true
+            } else {
+                false
+            }
+        })
     }
 
     fn set_raw() -> Result<libc::termios, io::Error> {
