@@ -7,6 +7,7 @@ use std::mem;
 use std::process::ExitCode;
 
 const CTRL_C: u8 = 0x03;
+const BS: u8 = 0x08;
 const LF: u8 = 0x0a;
 const CR: u8 = 0x0d;
 const ESC: u8 = 0x1b;
@@ -181,7 +182,6 @@ impl Termline {
                 }
                 _ => {
                     self.msg.replace_range(.., &format!("unhandled char: {b:#04x}"));
-                    write!(self.output, "<?>")?;
                     None
                 }
             },
@@ -198,8 +198,6 @@ impl Termline {
                 }
             },
             State::CSI => match b {
-                // TODO: handle Delete i.e. CSI 3 ~
-                // TODO: handle multi-byte CSI (parameters)
                 b'0'..=b'9' | b';' => {
                     self.args.push(b);
                     None
@@ -220,7 +218,7 @@ impl Termline {
                     self.transition(State::Normal);
                     if self.pos > 0 {
                         self.pos -= 1;
-                        Some(vec![ESC, b'[', b'D'])
+                        Some(vec![BS]) // BS instead of CUB to handle wrapping
                     } else {
                         self.msg.replace_range(.., &format!("CUB rejected"));
                         None
