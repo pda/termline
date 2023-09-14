@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::env;
 use std::io;
 use std::io::Error;
 use std::io::Read;
@@ -11,8 +12,6 @@ const CR: u8 = 0x0d;
 const CTRL_C: u8 = 0x03;
 const ESC: u8 = 0x1b;
 const LF: u8 = 0x0a;
-
-const DEBUG: bool = true;
 
 thread_local!(static SIGWINCH: RefCell<bool> = false.into());
 
@@ -34,6 +33,7 @@ struct Termline {
     args: Vec<u8>,
     msg: String,
     cols: Option<u16>,
+    debug: bool,
 }
 
 impl Termline {
@@ -48,6 +48,7 @@ impl Termline {
             args: Vec::new(),
             msg: String::new(),
             cols: None,
+            debug: false,
         })
     }
 
@@ -55,13 +56,21 @@ impl Termline {
         Self::new(Box::new(stdin()), Box::new(stderr()), prompt)
     }
 
+    fn set_debug(&mut self, debug: bool) {
+        self.debug = debug;
+    }
+
+    fn set_cols(&mut self, cols: u16) {
+        self.cols = Some(cols);
+    }
+
     fn run(&mut self) -> Result<Vec<u8>, Error> {
         let termios_orig = Self::set_raw();
         let mut bufin = [0; 16];
 
-        self.cols = Some(Self::get_width()?);
         Self::listen_for_window_resize()?;
 
+        self.output.write_all(&[CR, ESC, b'[', b'J'])?;
         self.output.write_all(&self.prompt)?;
         self.output.flush()?;
 
@@ -72,23 +81,50 @@ impl Termline {
                 self.cols = Some(Self::get_width()?);
             }
 
-            if DEBUG {
+            if self.debug {
+                let len = self.buf.len();
+                let pos = self.pos;
+                const WIN_SIZE: usize = 32;
+
+                // hello worl
+                // 0123456789
+                // len = 10
+                // WIN_SIZE = 4
+                // pos:0   [0..4]: hell  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 4
+                // pos:1   [0..4]: hell  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 4
+                // pos:2   [0..4]: hell  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 4
+                // pos:3   [1..5]: ello  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 5
+                // pos:4   [2..6]: llo_  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 6
+                // pos:5   [3..7]: lo_w  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 7
+                // pos:6   [4..8]: o_wo  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 8
+                // pos:7   [5..9]: _wor  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 9
+                // pos:8  [6..10]: worl  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 10
+                // pos:9  [6..10]: worl  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 10
+
+                let win_from = pos
+                    .saturating_sub(WIN_SIZE / 2)
+                    .clamp(0, len.saturating_sub(WIN_SIZE));
+
+                let win_to = (pos + WIN_SIZE / 2).clamp(WIN_SIZE.clamp(0, len), len);
+
                 let mut debug = vec![];
                 // ensure there's spare lines underneath
-                debug.extend_from_slice(&[LF, LF, LF, LF, LF, ESC, b'[', b'5', b'A']); // add new lines below prompt, scroll back up
+                debug.extend_from_slice(&[LF, LF, LF, LF, LF, LF, ESC, b'[', b'6', b'A']); // add new lines below prompt, scroll back up
                 debug.extend_from_slice(&[ESC, b'7']); // DECSC: DEC Save Cursor
+                debug.extend_from_slice(&[CR, LF]);
                 debug.extend_from_slice(&[ESC, b'[', b'J']); // Erase in Display (cursor to end)
                 debug.extend_from_slice(&[ESC, b'[', b'2', b'm']); // dim text
                 debug.extend(
                     format!(
-                        "\r\nbuf: {}\r\n     {}^pos:{} len:{}",
-                        String::from_utf8_lossy(&self.buf),
-                        " ".repeat(self.pos),
-                        self.pos,
-                        self.buf.len(),
+                        "buf: {}\r\n     {}^pos:{} len:{}",
+                        String::from_utf8_lossy(&self.buf[win_from..win_to]),
+                        " ".repeat(pos.saturating_sub(win_from)),
+                        pos,
+                        len,
                     )
                     .bytes(),
                 );
+                debug.extend(format!("\r\nwin_from={win_from} win_to={win_to}").bytes());
                 match self.cols {
                     None => debug.extend(format!("\r\ncols: ?").bytes()),
                     Some(cols) => debug.extend(format!("\r\ncols: {cols}").bytes()),
@@ -348,6 +384,36 @@ impl Termline {
 
 fn main() -> ExitCode {
     let mut termline = Termline::stdio("termline> ".into()).unwrap();
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut args = env::args().into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--debug" => termline.set_debug(true),
+            "--cols" => {
+                if let Some(val) = args.next() {
+                    if let Ok(cols) = val.parse::<u16>() {
+                        termline.set_cols(cols);
+                    } else {
+                        errors.push("--cols expects integer".into());
+                    }
+                } else {
+                    errors.push("--cols expects a value".into());
+                }
+            }
+            _ => {
+                errors.push(format!("unknown: {}", arg));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        let mut out = stderr().lock();
+        for e in errors {
+            write!(out, "args: {}\n", e).unwrap();
+        }
+        return ExitCode::FAILURE;
+    }
+
     match termline.run() {
         Ok(result) => {
             println!("{}", String::from_utf8_lossy(&result));
