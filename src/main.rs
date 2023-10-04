@@ -66,10 +66,6 @@ impl Termline {
         self.debug = debug;
     }
 
-    fn set_cols(&mut self, cols: usize) {
-        self.cols = cols;
-    }
-
     fn set_initial(&mut self, initial: Vec<u8>) {
         self.initial = Some(initial);
     }
@@ -509,17 +505,6 @@ fn main() -> ExitCode {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--debug" => termline.set_debug(true),
-            "--cols" => {
-                if let Some(val) = args.next() {
-                    if let Ok(cols) = val.parse::<usize>() {
-                        termline.set_cols(cols);
-                    } else {
-                        errors.push("--cols expects integer".into());
-                    }
-                } else {
-                    errors.push("--cols expects a value".into());
-                }
-            }
             "--initial" => {
                 if let Some(val) = args.next() {
                     termline.set_initial(val.into())
