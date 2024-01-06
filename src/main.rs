@@ -15,8 +15,6 @@ const CTRL_C: u8 = 0x03;
 const ESC: u8 = 0x1b;
 const LF: u8 = 0x0a;
 
-const DEFAULT_COLS: usize = 80;
-
 thread_local!(static SIGWINCH: RefCell<bool> = false.into());
 
 #[derive(Debug)]
@@ -30,31 +28,46 @@ struct Termline {
     input: Box<dyn Read>,
     output: Box<dyn Write>,
     prompt: Vec<u8>,
+    prompt_len: usize,
 
     buf: Vec<u8>,
-    pos: usize,
+    pos: usize,     // offset into virtual input buffer, copied after accept
+    newpos: usize,  // offset into virtual input buffer, mutating during accept
+    termpos: usize, // offset from start of first line, including prompt
     state: State,
     args: Vec<u8>,
-    msg: String,
     cols: usize,
     debug: bool,
     initial: Option<Vec<u8>>,
+
+    log: std::fs::File,
 }
 
 impl Termline {
     fn new(input: Box<dyn Read>, output: Box<dyn Write>, prompt: Vec<u8>) -> Result<Self, Error> {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("termline.log")
+            .unwrap();
+
+        let prompt_len = prompt.len();
+
         Ok(Self {
             input,
             output,
-            prompt: prompt.into(),
+            prompt,
+            prompt_len,
             buf: Vec::new(),
             pos: 0,
+            newpos: 0,
+            termpos: 0,
             state: State::Normal,
             args: Vec::new(),
-            msg: String::new(),
-            cols: DEFAULT_COLS,
+            cols: Self::get_width().unwrap_or(80),
             debug: false,
             initial: None,
+            log,
         })
     }
 
@@ -71,6 +84,8 @@ impl Termline {
     }
 
     fn run(&mut self) -> Result<Vec<u8>, Error> {
+        write!(self.log, "\nrun() cols:{}\n", self.cols)?;
+
         let termios_orig = Self::set_raw();
         let mut bufin = [0; 16];
 
@@ -80,11 +95,13 @@ impl Termline {
         self.output.write_all(&self.prompt)?;
         self.output.flush()?;
 
+        self.termpos += self.prompt_len;
+
         let mut run = true;
         let mut success = false;
         while run {
             if Self::has_window_resized() {
-                self.cols = Self::get_width()? as usize;
+                self.cols = Self::get_width()?;
             }
 
             // Push the --initial input into the state machine.
@@ -107,73 +124,20 @@ impl Termline {
                 }
             }
 
-            if self.debug {
-                let len = self.buf.len();
-                let pos = self.pos;
-                const WIN_SIZE: usize = 32;
-
-                // hello worl
-                // 0123456789
-                // len = 10
-                // WIN_SIZE = 4
-                // pos:0   [0..4]: hell  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 4
-                // pos:1   [0..4]: hell  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 4
-                // pos:2   [0..4]: hell  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 4
-                // pos:3   [1..5]: ello  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 5
-                // pos:4   [2..6]: llo_  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 6
-                // pos:5   [3..7]: lo_w  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 7
-                // pos:6   [4..8]: o_wo  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 8
-                // pos:7   [5..9]: _wor  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 9
-                // pos:8  [6..10]: worl  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 10
-                // pos:9  [6..10]: worl  clamp(pos + WIN_SIZE/2, WIN_SIZE, len) = 10
-
-                let win_from = pos
-                    .saturating_sub(WIN_SIZE / 2)
-                    .clamp(0, len.saturating_sub(WIN_SIZE));
-
-                let win_to = (pos + WIN_SIZE / 2).clamp(WIN_SIZE.clamp(0, len), len);
-
-                let mut debug = vec![];
-                // ensure there's spare lines underneath
-                debug.extend_from_slice(&[LF, LF, LF, LF, LF, LF, ESC, b'[', b'6', b'A']); // add new lines below prompt, scroll back up
-                debug.extend_from_slice(&[ESC, b'7']); // DECSC: DEC Save Cursor
-                debug.extend_from_slice(&[CR, LF]);
-                debug.extend_from_slice(&[ESC, b'[', b'J']); // Erase in Display (cursor to end)
-                debug.extend_from_slice(&[ESC, b'[', b'2', b'm']); // dim text
-                debug.extend(
-                    format!(
-                        "buf: {}\r\n     {}^pos:{} len:{}",
-                        String::from_utf8_lossy(&self.buf[win_from..win_to]),
-                        " ".repeat(pos.saturating_sub(win_from)),
-                        pos,
-                        len,
-                    )
-                    .bytes(),
-                );
-                debug.extend(format!("\r\nwin_from={win_from} win_to={win_to}").bytes());
-                debug.extend(format!("\r\ncols: {}", self.cols).bytes());
-                debug.extend(
-                    format!(
-                        "\r\nstate: {:?}, args: [{}]",
-                        self.state,
-                        String::from_utf8_lossy(&self.args),
-                    )
-                    .bytes(),
-                );
-                debug.extend(format!("\r\nmsg: {}", self.msg).bytes());
-                debug.extend_from_slice(&[ESC, b'8']); // DECRC: DEC Restore Cursor
-                self.output.write_all(&debug)?;
-                self.output.flush()?
-            }
-
             match self.input.read(&mut bufin) {
-                Ok(size) => {
-                    for n in 0..size {
+                Ok(len) => {
+                    write!(
+                        self.log,
+                        "read() → len:{len} {}\n",
+                        fmt_bytes(&bufin[0..len])
+                    )?;
+
+                    for n in 0..len {
                         match bufin[n] {
                             CTRL_C => run = false,
                             CR | LF => (run, success) = (false, true),
-                            n => match self.accept(n) {
-                                Ok(r) => match r {
+                            byte => match self.accept(byte) {
+                                Ok(result) => match result {
                                     Some(out) => {
                                         self.output.write_all(&out)?;
                                         self.output.flush()?;
@@ -188,7 +152,7 @@ impl Termline {
                         }
                     }
                 }
-                Err(e) => self.msg.replace_range(.., &format!("read error: {e}")),
+                Err(_) => (),
             };
         }
 
@@ -210,30 +174,48 @@ impl Termline {
     }
 
     fn accept(&mut self, b: u8) -> Result<Option<Vec<u8>>, Error> {
+        write!(self.log, "accept({})\n", fmt_byte(b))?;
+
         Ok(match self.state {
             State::Normal => match b {
                 0x20..=0x7e /* printable ASCII */ => {
+                    write!(
+                        self.log,
+                        "'{}' -> pos:{}/len:{}\n",
+                        b as char,
+                        self.pos,
+                        self.buf.len(),
+
+                    )?;
                     self.buf.insert(self.pos, b);
-                    self.pos += 1;
-                    let tail = &self.buf[self.pos..];
+                    self.newpos += 1;
 
-                    let mut to_emit = vec![b];
+                    self.update_line()?
 
-                    // wrap to the next line if we're at the end
-                    if (self.pos + self.prompt.len()) % self.cols == 0 {
-                        to_emit.extend_from_slice(&[CR, LF]); // go to start of next line
-                        to_emit.extend_from_slice(&[ESC, CSI, b'K']); // clear to end of line
-                    }
+                    //let tail = &self.buf[self.pos..];
 
-                    if tail.len() > 0 {
-                        to_emit.extend_from_slice(tail);
-                        to_emit.extend_from_slice(&[ESC, b'[', b'K']);
-                        // CSI CUB tail.len()
-                        to_emit.extend_from_slice(&[ESC, b'[']);
-                        to_emit.extend_from_slice(&tail.len().to_string().as_bytes());
-                        to_emit.extend_from_slice(&[b'D']);
-                    }
-                    Some(to_emit)
+                    //let mut to_emit = vec![b];
+
+                    //// wrap to the next line if we're at the end
+                    //if (self.pos + self.prompt.len()) % self.cols == 0 {
+                    //    write!(self.log, "wrap at (prompt:{} + pos:{} = term_pos:{}) % cols:{} = {}\n", self.prompt_len, self.pos, self.term_pos(), self.cols, self.term_pos() % self.cols)?;
+
+                    //    // ensure we're at the start of the next line by spacing on further, then
+                    //    // going to start of line.
+                    //    // https://stackoverflow.com/a/31360700
+                    //    to_emit.extend_from_slice(&[b' ', ESC, CSI, b'G']); // go to start of next line
+                    //    to_emit.extend_from_slice(&[ESC, CSI, b'K']); // clear to end of line
+                    //}
+
+                    //if tail.len() > 0 {
+                    //    to_emit.extend_from_slice(tail);
+                    //    to_emit.extend_from_slice(&[ESC, b'[', b'K']); // CSI EL (erase in line)
+                    //    // CSI CUB tail.len()
+                    //    to_emit.extend_from_slice(&[ESC, b'[']);
+                    //    to_emit.extend_from_slice(&tail.len().to_string().as_bytes());
+                    //    to_emit.extend_from_slice(&[b'D']);
+                    //}
+                    //Some(to_emit)
                 }
                 0x7f /* backspace */ => {
                     if self.pos >= 1 {
@@ -244,8 +226,11 @@ impl Termline {
 
                         // check for wrap
                         if (self.pos + self.prompt.len()) % self.cols == self.cols - 1 {
-                            // unwrap up to the end of the previous line
-                            to_emit.extend_from_slice(&[ESC, CSI, b'A']); // CUU: cursor up
+
+                            // unwrap up to the end of the previous line...
+
+                            // CUU: cursor up
+                            to_emit.extend_from_slice(&[ESC, CSI, b'A']);
 
                             // CHA: cursor horizontal absolute
                             to_emit.extend_from_slice(&[ESC, CSI]);
@@ -263,7 +248,7 @@ impl Termline {
                             to_emit.extend_from_slice(&[ESC, b'[', b'K']); // clear to end of line
                             to_emit.extend_from_slice(&[ESC, b'[', b'J']); // clear to end of screen
 
-                            let remaining_cols = self.cols.saturating_sub((self.prompt.len() + self.pos) % self.cols);
+                            let remaining_cols = self.cols.saturating_sub((self.term_pos()) % self.cols);
                             let mut remaining_tail = tail;
 
                             // emit the remainder columns of the current row
@@ -290,13 +275,13 @@ impl Termline {
                             let delta_x = wanted_x as i32 - actual_x as i32;
                             let delta_y = wanted_y as i32 - actual_y as i32;
 
-                            self.msg.replace_range(
-                                ..,
-                                &format!(
-                                    "prompt+buf:{} actual_x:{actual_x} actual_y:{actual_y} wanted_x:{wanted_x} wanted_y:{wanted_y} delta_x:{delta_x} delta_y:{delta_y}",
-                                    self.prompt.len() + self.buf.len(),
-                                )
-                            );
+                            // self.msg.replace_range(
+                            //     ..,
+                            //     &format!(
+                            //         "prompt+buf:{} actual_x:{actual_x} actual_y:{actual_y} wanted_x:{wanted_x} wanted_y:{wanted_y} delta_x:{delta_x} delta_y:{delta_y}",
+                            //         self.prompt_len + self.buf.len(),
+                            //     )
+                            // );
 
                             if delta_x != 0 {
                                 // CHA: Cursor Horizontal Absolute
@@ -332,7 +317,7 @@ impl Termline {
                     None
                 }
                 _ => {
-                    self.msg.replace_range(.., &format!("unhandled char: {b:#04x}"));
+                    // self.msg.replace_range(.., &format!("unhandled char: {b:#04x}"));
                     None
                 }
             },
@@ -342,8 +327,8 @@ impl Termline {
                     None
                 }
                 _ => {
-                    self.msg
-                        .replace_range(.., &format!("unhandled escape: {b:#04x}"));
+                    // self.msg
+                    //     .replace_range(.., &format!("unhandled escape: {b:#04x}"));
                     self.transition(State::Normal);
                     None
                 }
@@ -358,13 +343,13 @@ impl Termline {
                     self.transition(State::Normal);
                     if self.pos < self.buf.len() {
                         self.pos += 1;
-                        if (self.prompt.len() + self.pos) % self.cols == 0 {
+                        if (self.term_pos()) % self.cols == 0 {
                             Some(vec![CR, LF])
                         } else {
                             Some(vec![ESC, b'[', b'C'])
                         }
                     } else {
-                        self.msg.replace_range(.., &format!("CUF rejected"));
+                        // self.msg.replace_range(.., &format!("CUF rejected"));
                         None
                     }
                 }
@@ -374,7 +359,7 @@ impl Termline {
                     if self.pos > 0 {
                         self.pos -= 1;
                         let mut to_emit = vec![];
-                        if (self.prompt.len() + self.pos) % self.cols == self.cols - 1 {
+                        if (self.term_pos()) % self.cols == self.cols - 1 {
                             // CUU
                             to_emit.extend_from_slice(&[ESC, b'[', b'A']);
                             // CHA to last column
@@ -386,7 +371,7 @@ impl Termline {
                         }
                         Some(to_emit)
                     } else {
-                        self.msg.replace_range(.., &format!("CUB rejected"));
+                        // self.msg.replace_range(.., &format!("CUB rejected"));
                         None
                     }
                 }
@@ -395,8 +380,8 @@ impl Termline {
                     // DEL (CSI 3 ~)
                     [b'3'] => {
                         if self.pos < self.buf.len() {
-                            let x = self.buf.remove(self.pos);
-                            self.msg.replace_range(.., &format!("DEL: {:#04X}", x));
+                            let _x = self.buf.remove(self.pos);
+                            // self.msg.replace_range(.., &format!("DEL: {:#04X}", x));
                             let tail = &self.buf[self.pos..];
                             let mut emit = vec![];
                             if tail.len() > 0 {
@@ -419,15 +404,15 @@ impl Termline {
                         }
                     }
                     _ => {
-                        self.msg
-                            .replace_range(.., &format!("unhandled VT input {:?}~", self.args));
+                        // self.msg
+                        //     .replace_range(.., &format!("unhandled VT input {:?}~", self.args));
                         self.transition(State::Normal);
                         None
                     }
                 },
                 _ => {
-                    self.msg
-                        .replace_range(.., &format!("unhandled CSI {b:#04x}"));
+                    // self.msg
+                    //     .replace_range(.., &format!("unhandled CSI {b:#04x}"));
                     self.transition(State::Normal);
                     None
                 }
@@ -435,16 +420,103 @@ impl Termline {
         })
     }
 
+    fn update_line(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        // pos_delta: where we are now in the input buffer vs where we were before
+        let pos_delta = self.newpos - self.pos;
+
+        let tail = &self.buf[self.pos..];
+
+        write!(
+            self.log,
+            "update_line() pos:{} newpos:{} pos_delta:{} termpos:{} len:{} tail.len:{}\n",
+            self.pos,
+            self.newpos,
+            pos_delta,
+            self.term_pos(),
+            self.buf.len(),
+            tail.len(),
+        )?;
+
+        let mut to_emit = vec![];
+
+        //// wrap to the next line if we're at the end
+        //if (self.pos + self.prompt.len()) % self.cols == 0 {
+        //    write!(
+        //        self.log,
+        //        "wrap at (prompt:{} + pos:{} = term_pos:{}) % cols:{} = {}\n",
+        //        self.prompt_len,
+        //        self.pos,
+        //        self.term_pos(),
+        //        self.cols,
+        //        self.term_pos() % self.cols
+        //    )?;
+
+        //    // ensure we're at the start of the next line by spacing on further, then
+        //    // going to start of line.
+        //    // https://stackoverflow.com/a/31360700
+        //    to_emit.extend_from_slice(&[b' ', ESC, CSI, b'G']); // go to start of next line
+        //    to_emit.extend_from_slice(&[ESC, CSI, b'K']); // clear to end of line
+        //}
+
+        if tail.len() > 0 {
+            to_emit.extend_from_slice(tail);
+            to_emit.extend_from_slice(&[ESC, b'[', b'K']); // CSI EL (erase in line)
+
+            // // CSI CUB tail.len()
+            // to_emit.extend_from_slice(&[ESC, b'[']);
+            // to_emit.extend_from_slice(&tail.len().to_string().as_bytes());
+            // to_emit.extend_from_slice(&[b'D']);
+        }
+
+        let plen = self.prompt.len();
+        let actual_x = (plen + self.buf.len()) % self.cols;
+        let actual_y = (plen + self.buf.len()) / self.cols;
+        let wanted_x = (plen + self.pos) % self.cols;
+        let wanted_y = (plen + self.pos) / self.cols;
+        let delta_x = wanted_x as i32 - actual_x as i32;
+        let delta_y = wanted_y as i32 - actual_y as i32;
+
+        if delta_x != 0 {
+            // CHA: Cursor Horizontal Absolute
+            to_emit.extend_from_slice(&[ESC, b'[']);
+            to_emit.extend_from_slice((wanted_x + 1).to_string().as_bytes());
+            to_emit.extend_from_slice(&[b'G']);
+        }
+
+        if delta_y < 0 {
+            // CUU
+            to_emit.extend_from_slice(&[ESC, b'[']);
+            to_emit.extend_from_slice(delta_y.abs().to_string().as_bytes());
+            to_emit.extend_from_slice(&[b'A']);
+        } else if delta_y > 0 {
+            // CUD
+            to_emit.extend_from_slice(&[ESC, b'[']);
+            to_emit.extend_from_slice(delta_y.to_string().as_bytes());
+            to_emit.extend_from_slice(&[b'B']);
+        }
+
+        self.pos = self.newpos;
+
+        write!(self.log, "to_emit:{}\n", fmt_bytes(&to_emit))?;
+
+        Ok(Some(to_emit))
+    }
+
+    // Position including prompt length
+    fn term_pos(&self) -> usize {
+        self.prompt_len + self.pos
+    }
+
     fn transition(&mut self, s: State) {
         self.args.clear();
         self.state = s;
     }
 
-    fn get_width() -> Result<u16, Error> {
+    fn get_width() -> Result<usize, Error> {
         unsafe {
             let mut ws: libc::winsize = mem::zeroed();
             Self::check_c_err(libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws))?;
-            Ok(ws.ws_col)
+            Ok(ws.ws_col as usize)
         }
     }
 
@@ -533,4 +605,36 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn fmt_bytes(bytes: &[u8]) -> String {
+    format!(
+        "[{}]",
+        bytes
+            .iter()
+            .map(|&byte| fmt_byte(byte))
+            .collect::<Vec<String>>()
+            .join(" ")
+    )
+}
+
+fn fmt_byte(b: u8) -> String {
+    let tmp: String;
+    format!(
+        "{:02X}:{}",
+        b,
+        match b {
+            CTRL_C => "Ctrl-C",
+            BS => "BS",
+            LF => "LF",
+            CR => "CR",
+            ESC => "ESC",
+            32..=126 => {
+                tmp = format!("\"{}\"", b as char);
+                &*tmp
+            }
+            _ => "?",
+        }
+        .to_string()
+    )
 }
